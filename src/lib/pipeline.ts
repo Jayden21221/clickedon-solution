@@ -16,6 +16,46 @@ export interface GenerateResult {
 }
 
 const MAX_REVISIONS = 3;
+const MAX_STREAM_ATTEMPTS = 3;
+
+function isTransient429Error(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "status" in error &&
+    typeof error.status === "number" &&
+    error.status === 429
+  );
+}
+
+function isJsonExtractionError(error: unknown): boolean {
+  return (
+    error instanceof SyntaxError ||
+    (error instanceof Error && error.message === "No fenced JSON block found")
+  );
+}
+
+async function streamValidDraft(
+  behavior: MockBehavior,
+  state: MockState,
+): Promise<void> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_STREAM_ATTEMPTS; attempt += 1) {
+    try {
+      const text = await mockStream(behavior, state);
+      extractJson(text);
+      return;
+    } catch (error) {
+      lastError = error;
+
+      if (!isTransient429Error(error) && !isJsonExtractionError(error)) {
+        break;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Draft streaming failed");
+}
 
 /**
  * Runs one content-generation pass: stream a draft, extract it, revise until it
@@ -28,23 +68,26 @@ const MAX_REVISIONS = 3;
 export async function generate(input: GenerateInput): Promise<GenerateResult> {
   const state: MockState = { calls: 0 };
 
-  // The model call can fail transiently (rate limits) or return a truncated
-  // stream. Right now a single hiccup takes down the whole run.
-  const text = await mockStream(input.behavior, state);
-  extractJson(text);
-
-  // Revise until the draft passes review.
-  let attempt = 0;
-  while (!input.reviewPasses(attempt) && attempt < 50) {
-    attempt += 1;
+  try {
+    await streamValidDraft(input.behavior, state);
+  } catch {
+    return { status: "error", attempts: state.calls };
   }
 
-  // Kick off the next stage and return.
-  void input.advanceToNextStage().catch(() => {
-    /* ignored */
-  });
+  for (let attempt = 1; attempt <= MAX_REVISIONS; attempt += 1) {
+    if (!input.reviewPasses(attempt)) {
+      continue;
+    }
 
-  return { status: "ok", attempts: attempt };
+    try {
+      await input.advanceToNextStage();
+      return { status: "ok", attempts: attempt };
+    } catch {
+      return { status: "error", attempts: attempt };
+    }
+  }
+
+  return { status: "error", attempts: MAX_REVISIONS };
 }
 
 export { MAX_REVISIONS };
